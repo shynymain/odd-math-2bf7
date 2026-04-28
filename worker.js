@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
-    if (url.pathname === '/' || url.pathname === '/api/health') return cors(Response.json({ ok:true, name:'rev-ocr-worker-no-example-fixed', version:'2026-04-29-object-response-fixed' }));
+    if (url.pathname === '/' || url.pathname === '/api/health') return cors(Response.json({ ok:true, name:'rev-ocr-worker-retry-nonempty-fixed', version:'2026-04-29-retry-nonempty-fixed' }));
     if (url.pathname !== '/api/ocr') return cors(Response.json({ ok:false, error:'Not found', path:url.pathname }, { status:404 }));
     if (request.method !== 'POST') return cors(Response.json({ ok:false, error:'POST only' }, { status:405 }));
     try {
@@ -24,50 +24,111 @@ export default {
 };
 
 async function recognizeOne(env, file, mode, headcount) {
-  const image = [...new Uint8Array(await file.arrayBuffer())];
-  const prompt = buildPrompt(mode, headcount);
-  let aiResult;
-  try {
-    aiResult = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
-      image,
-      prompt,
-      temperature: 0,
-      max_tokens: 1400
-    });
-  } catch (e) {
-    return { ok:false, file:file.name || '', error:'AI run failed: ' + String(e?.message || e) };
+  const imageBytes = new Uint8Array(await file.arrayBuffer());
+  const image = [...imageBytes];
+  const attempts = buildAttempts(mode, headcount);
+  const tried = [];
+
+  for (let i = 0; i < attempts.length; i++) {
+    const prompt = attempts[i];
+    let aiResult;
+    try {
+      aiResult = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
+        image,
+        prompt,
+        temperature: 0,
+        max_tokens: 1800
+      });
+    } catch (e) {
+      tried.push({ attempt:i+1, error:'AI run failed: ' + String(e?.message || e) });
+      continue;
+    }
+
+    const text = normalizeAIText(aiResult);
+    const parsed = parseSingleJSON(text);
+    if (!parsed) {
+      tried.push({ attempt:i+1, error:'AI returned non-JSON text', rawText:text.slice(0, 1200) });
+      continue;
+    }
+
+    const data = normalizeData(parsed);
+    const meaningful = hasMeaningfulData(data, mode);
+    tried.push({ attempt:i+1, ok:true, meaningful, rawText:text.slice(0, 1200) });
+
+    if (meaningful) {
+      return { ok:true, file:file.name || '', data, rawText:text.slice(0, 3000), attempts: tried };
+    }
   }
-  const text = normalizeAIText(aiResult);
-  const parsed = parseSingleJSON(text);
-  if (!parsed) return { ok:false, file:file.name || '', error:'AI returned non-JSON text', rawText: text.slice(0, 6000) };
-  const data = normalizeData(parsed);
-  return { ok:true, file:file.name || '', data, rawText:text.slice(0, 3000) };
+
+  return {
+    ok:false,
+    file:file.name || '',
+    error:'JSONにはなりましたが、画像から実データを抽出できませんでした。画像が小さい/表が細かい/余白が多い可能性があります。modeを horses / odds / result に分けて再実行してください。',
+    data: emptyData(),
+    attempts: tried
+  };
 }
 
-function buildPrompt(mode, headcount) {
-  const base = [
-    'あなたは競馬画像専用の構造化OCRです。',
-    '出力はJSONオブジェクト1個だけです。',
-    '説明文、前置き、後書き、Markdown、コードブロック、コメント、例、繰り返しは禁止です。',
-    '最初の1文字は必ず { です。最後の1文字は必ず } です。',
-    'JSON以外を1文字でも出してはいけません。',
-    '読み取れない値は空文字にしてください。推測で埋めないでください。',
-    '同じ空テンプレートを複数回出してはいけません。',
-    '配列には画像から読み取れた実データだけを入れてください。',
-    `mode=${mode} headcount=${headcount || ''}`,
-    'キーは必ず ok,race,horses,odds,result の5つです。',
-    'race は name,place,grade,surface,distance を持ちます。',
-    'horses は frame,no,name,last1,last2,last3 を持つ配列です。',
-    'odds は no,name,odds を持つ配列です。',
-    'result は firstNo,first,secondNo,second,thirdNo,third,umaren,umarenPay,sanrenpuku,sanrenpukuPay を持ちます。',
-    'modeがhorsesの場合は出馬表、馬番、枠、馬名、前走/前2走/前3走を優先します。',
-    'modeがoddsの場合は単勝オッズ、馬番、馬名、オッズを優先します。',
-    'modeがresultの場合は1着2着3着、馬連、3連複、払戻を優先します。',
-    'modeがautoの場合は画像内で読めるものだけ抽出します。',
-    '馬番は数字だけ。枠は1から8の数字だけ。着順は数字だけ。オッズは小数可。払戻は数字だけ。',
-    '返すJSON構造: {"ok":true,"race":{"name":"","place":"","grade":"","surface":"","distance":""},"horses":[],"odds":[],"result":{"firstNo":"","first":"","secondNo":"","second":"","thirdNo":"","third":"","umaren":"","umarenPay":"","sanrenpuku":"","sanrenpukuPay":""}}'
-  ];
-  return base.join('\n');
+function buildAttempts(mode, headcount) {
+  const modes = mode === 'auto' ? ['horses','odds','result','auto'] : [mode, 'auto'];
+  return [...new Set(modes)].map((m, idx) => buildPrompt(m, headcount, idx + 1));
+}
+
+function emptyData(){
+  return { ok:false, race:{name:'',place:'',grade:'',surface:'',distance:''}, horses:[], odds:[], result:{firstNo:'',first:'',secondNo:'',second:'',thirdNo:'',third:'',umaren:'',umarenPay:'',sanrenpuku:'',sanrenpukuPay:''} };
+}
+
+function hasMeaningfulData(data, mode){
+  if (!data) return false;
+  const hasHorse = Array.isArray(data.horses) && data.horses.some(h => h.no || h.name || h.last1 || h.last2 || h.last3);
+  const hasOdds = Array.isArray(data.odds) && data.odds.some(o => o.no || o.name || o.odds);
+  const hasRes = hasResult(data.result);
+  const hasRc = hasRace(data.race);
+  if (mode === 'horses') return hasHorse;
+  if (mode === 'odds') return hasOdds;
+  if (mode === 'result') return hasRes;
+  return hasHorse || hasOdds || hasRes || hasRc;
+}
+
+function buildPrompt(mode, headcount, attemptNo = 1) {
+  const target = mode === 'horses'
+    ? '出馬表です。馬番・枠番・馬名・前走着順・前2走着順・前3走着順を読む。'
+    : mode === 'odds'
+      ? '単勝オッズ表です。馬番・馬名・単勝オッズを読む。人気は不要。'
+      : mode === 'result'
+        ? 'レース結果/払戻です。1着・2着・3着・馬連・3連複・払戻金を読む。'
+        : '競馬画像です。読める出馬表・単勝オッズ・結果・払戻だけ読む。';
+
+  const required = mode === 'horses'
+    ? 'horses配列に、画像内で見える馬を必ず1頭ずつ入れる。'
+    : mode === 'odds'
+      ? 'odds配列に、画像内で見える単勝オッズを必ず1頭ずつ入れる。'
+      : mode === 'result'
+        ? 'resultに、画像内で見える着順/払戻を必ず入れる。'
+        : 'horses/odds/resultのうち、画像内で見えるデータを必ず入れる。';
+
+  return [
+    '競馬画像OCR。JSONだけを返す。',
+    '説明文、例、Markdown、コメント、同じJSONの繰り返しは禁止。',
+    '最初は { 、最後は } 。JSONオブジェクトは1個だけ。',
+    '空テンプレートは禁止。画像に文字が見える場合、必ず実データを入れる。',
+    '読み取れない1項目だけ空文字。全項目を空にしてはいけない。',
+    '馬番は先頭の数字。馬名は日本語/カタカナ/英字の馬名。',
+    '表は左から右、上から下に読み、1行=1頭として扱う。',
+    '同じ値を大量に繰り返してはいけない。',
+    `mode=${mode}`,
+    `attempt=${attemptNo}`,
+    `headcount=${headcount || ''}`,
+    target,
+    required,
+    '返すキーは ok,race,horses,odds,result の5つだけ。',
+    'race: name,place,grade,surface,distance',
+    'horses要素: frame,no,name,last1,last2,last3',
+    'odds要素: no,name,odds',
+    'result: firstNo,first,secondNo,second,thirdNo,third,umaren,umarenPay,sanrenpuku,sanrenpukuPay',
+    '画像に対象データが全く見えない場合だけ ok:false で空配列にする。',
+    '画像に1文字でも馬番/馬名/オッズ/着順が見えるなら ok:true にして該当配列へ入れる。'
+  ].join('\n');
 }
 
 function normalizeAIText(v) {
