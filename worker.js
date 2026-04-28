@@ -116,6 +116,8 @@ function buildPrompt(mode, headcount, attemptNo = 1) {
     '馬番は先頭の数字。馬名は日本語/カタカナ/英字の馬名。',
     '表は左から右、上から下に読み、1行=1頭として扱う。',
     '同じ値を大量に繰り返してはいけない。',
+    '画像に見えない馬番を補完してはいけない。8頭しか見えなければ8頭だけ返す。',
+    '前走/前2走/前3走は、同じ3-4-5などで全頭にコピーしてはいけない。見えない場合は空文字。',
     `mode=${mode}`,
     `attempt=${attemptNo}`,
     `headcount=${headcount || ''}`,
@@ -186,10 +188,11 @@ function extractJSONObjects(text) {
 function normalizeData(d) {
   const race = d.race || {};
   const result = d.result || {};
-  const horses = Array.isArray(d.horses) ? d.horses.map(h => ({
+  let horses = Array.isArray(d.horses) ? d.horses.map(h => ({
     frame: cleanNum(h.frame), no: cleanNum(h.no || h.number), name: cleanName(h.name),
     last1: cleanNum(h.last1), last2: cleanNum(h.last2), last3: cleanNum(h.last3)
   })).filter(h => h.no || h.name) : [];
+  horses = removeHallucinatedHorses(horses);
   const odds = Array.isArray(d.odds) ? d.odds.map(o => ({
     no: cleanNum(o.no || o.number), name: cleanName(o.name), odds: cleanOdds(o.odds)
   })).filter(o => o.no || o.name || o.odds) : [];
@@ -205,6 +208,21 @@ function normalizeData(d) {
       sanrenpuku: cleanTicket(result.sanrenpuku), sanrenpukuPay: cleanPay(result.sanrenpukuPay)
     }
   };
+}
+function removeHallucinatedHorses(horses){
+  if(!Array.isArray(horses) || horses.length < 4) return horses || [];
+  const nameCounts = new Map();
+  const seqCounts = new Map();
+  for(const h of horses){
+    if(h.name) nameCounts.set(h.name, (nameCounts.get(h.name)||0)+1);
+    const seq = [h.last1,h.last2,h.last3].join('-');
+    if(seq !== '--') seqCounts.set(seq, (seqCounts.get(seq)||0)+1);
+  }
+  const maxSameName = Math.max(0, ...nameCounts.values());
+  const maxSameSeq = Math.max(0, ...seqCounts.values());
+  // AIが『マイディ 3,4,5』のような同一行を増殖させた場合は全体を破棄する
+  if(maxSameName >= 3 || maxSameSeq >= Math.ceil(horses.length * 0.7)) return [];
+  return horses.filter(h => Number(h.no||0) > 0 && Number(h.no||0) <= 30);
 }
 function cleanNum(v){ return String(v ?? '').replace(/[０-９]/g,s=>String.fromCharCode(s.charCodeAt(0)-0xFEE0)).replace(/[^0-9]/g,''); }
 function cleanOdds(v){ return String(v ?? '').replace(/[０-９．]/g,s=>s==='．'?'.':String.fromCharCode(s.charCodeAt(0)-0xFEE0)).replace(/[^0-9.]/g,''); }
