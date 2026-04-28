@@ -1,6 +1,6 @@
-name = "rev-full-auto-ocr-worker"
+name = "rev-ocr-worker-no-example-fixed"
 main = "worker.js"
-compatibility_date = "2024-12-01"
+compatibility_date = "2024-11-01"
 
 [ai]
 binding = "AI"

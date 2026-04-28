@@ -1,105 +1,158 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-    if (url.pathname === "/" || url.pathname === "/api/health") return json({ ok: true, service: "rev-full-auto-ocr-worker", time: new Date().toISOString() });
-    if (url.pathname !== "/api/ocr") return json({ ok: false, error: "Not found. Use /api/ocr" }, 404);
-    if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
-    if (!env.AI) return json({ ok: false, error: "Workers AI binding がありません。Cloudflareで binding 名 AI を追加してください。" }, 500);
-
+    if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
+    if (url.pathname === '/' || url.pathname === '/api/health') return cors(Response.json({ ok:true, name:'rev-ocr-worker-no-example-fixed', version:'2026-04-29-no-example-json-only' }));
+    if (url.pathname !== '/api/ocr') return cors(Response.json({ ok:false, error:'Not found', path:url.pathname }, { status:404 }));
+    if (request.method !== 'POST') return cors(Response.json({ ok:false, error:'POST only' }, { status:405 }));
     try {
+      if (!env.AI) return cors(Response.json({ ok:false, error:'Cloudflare Workers AI binding AI がありません' }, { status:500 }));
       const form = await request.formData();
-      const mode = String(form.get("mode") || "auto");
-      const headcount = Number(form.get("headcount") || 0);
-      const files = [...form.getAll("files"), ...form.getAll("file")].filter(v => v && typeof v.arrayBuffer === "function");
-      if (!files.length) return json({ ok: false, error: "画像ファイルがありません" }, 400);
-
+      const files = form.getAll('files').length ? form.getAll('files') : [form.get('file')].filter(Boolean);
+      const mode = String(form.get('mode') || 'auto');
+      const headcount = String(form.get('headcount') || '');
+      if (!files.length) return cors(Response.json({ ok:false, error:'画像ファイルがありません' }, { status:400 }));
       const raw = [];
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const prompt = buildPrompt({ mode, index: i + 1, total: files.length, headcount });
-        const ai = await env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
-          image: bytes,
-          prompt,
-          temperature: 0,
-          max_tokens: 2200
-        });
-        const text = normalizeAIText(ai);
-        const parsed = extractJSON(text);
-        if (parsed) raw.push({ ok: true, file: file.name || `image-${i+1}`, data: sanitize(parsed), rawText: text.slice(0, 4000) });
-        else raw.push({ ok: false, file: file.name || `image-${i+1}`, error: "AI returned non-JSON text", rawText: text.slice(0, 6000) });
-      }
-      const merged = mergeData(raw.map(r => r.data).filter(Boolean));
+      for (const file of files) raw.push(await recognizeOne(env, file, mode, headcount));
+      const merged = mergeAll(raw);
       const ok = raw.some(r => r.ok) && (merged.horses.length || merged.odds.length || hasResult(merged.result) || hasRace(merged.race));
-      return json({ ok, mode, count: files.length, merged, raw });
+      return cors(Response.json({ ok, mode, count: files.length, merged, raw }));
     } catch (e) {
-      return json({ ok: false, error: e.message, stack: e.stack }, 500);
+      return cors(Response.json({ ok:false, error:String(e?.message || e) }, { status:500 }));
     }
   }
 };
 
-function cors(res){
-  const h = new Headers(res.headers);
-  h.set("Access-Control-Allow-Origin", "*");
-  h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  h.set("Access-Control-Allow-Headers", "Content-Type");
-  return new Response(res.body, { status: res.status, headers: h });
+async function recognizeOne(env, file, mode, headcount) {
+  const image = [...new Uint8Array(await file.arrayBuffer())];
+  const prompt = buildPrompt(mode, headcount);
+  let aiResult;
+  try {
+    aiResult = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
+      image,
+      prompt,
+      temperature: 0,
+      max_tokens: 1400
+    });
+  } catch (e) {
+    return { ok:false, file:file.name || '', error:'AI run failed: ' + String(e?.message || e) };
+  }
+  const text = normalizeAIText(aiResult);
+  const parsed = parseSingleJSON(text);
+  if (!parsed) return { ok:false, file:file.name || '', error:'AI returned non-JSON text', rawText: text.slice(0, 6000) };
+  const data = normalizeData(parsed);
+  return { ok:true, file:file.name || '', data, rawText:text.slice(0, 3000) };
 }
-function json(obj, status=200){ return cors(Response.json(obj, { status })); }
-function normalizeAIText(ai){
-  if (typeof ai === "string") return ai;
-  if (ai?.response) return String(ai.response);
-  if (ai?.result) return typeof ai.result === "string" ? ai.result : JSON.stringify(ai.result);
-  if (ai?.text) return String(ai.text);
-  return JSON.stringify(ai);
+
+function buildPrompt(mode, headcount) {
+  const base = [
+    'あなたは競馬画像専用の構造化OCRです。',
+    '出力はJSONオブジェクト1個だけです。',
+    '説明文、前置き、後書き、Markdown、コードブロック、コメント、例、繰り返しは禁止です。',
+    '最初の1文字は必ず { です。最後の1文字は必ず } です。',
+    'JSON以外を1文字でも出してはいけません。',
+    '読み取れない値は空文字にしてください。推測で埋めないでください。',
+    '同じ空テンプレートを複数回出してはいけません。',
+    '配列には画像から読み取れた実データだけを入れてください。',
+    `mode=${mode} headcount=${headcount || ''}`,
+    'キーは必ず ok,race,horses,odds,result の5つです。',
+    'race は name,place,grade,surface,distance を持ちます。',
+    'horses は frame,no,name,last1,last2,last3 を持つ配列です。',
+    'odds は no,name,odds を持つ配列です。',
+    'result は firstNo,first,secondNo,second,thirdNo,third,umaren,umarenPay,sanrenpuku,sanrenpukuPay を持ちます。',
+    'modeがhorsesの場合は出馬表、馬番、枠、馬名、前走/前2走/前3走を優先します。',
+    'modeがoddsの場合は単勝オッズ、馬番、馬名、オッズを優先します。',
+    'modeがresultの場合は1着2着3着、馬連、3連複、払戻を優先します。',
+    'modeがautoの場合は画像内で読めるものだけ抽出します。',
+    '馬番は数字だけ。枠は1から8の数字だけ。着順は数字だけ。オッズは小数可。払戻は数字だけ。',
+    '返すJSON構造: {"ok":true,"race":{"name":"","place":"","grade":"","surface":"","distance":""},"horses":[],"odds":[],"result":{"firstNo":"","first":"","secondNo":"","second":"","thirdNo":"","third":"","umaren":"","umarenPay":"","sanrenpuku":"","sanrenpukuPay":""}}'
+  ];
+  return base.join('\n');
 }
-function extractJSON(text){
+
+function normalizeAIText(v) {
+  if (typeof v === 'string') return v.trim();
+  if (v?.response) return String(v.response).trim();
+  if (v?.result) return String(v.result).trim();
+  if (v?.text) return String(v.text).trim();
+  if (Array.isArray(v)) return v.map(normalizeAIText).join('\n').trim();
+  return JSON.stringify(v || '').trim();
+}
+
+function parseSingleJSON(text) {
   if (!text) return null;
-  let t = String(text).trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/,"").trim();
+  let t = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/,'').trim();
   try { return JSON.parse(t); } catch {}
-  const first = t.indexOf("{"); const last = t.lastIndexOf("}");
-  if (first >= 0 && last > first) {
-    const sub = t.slice(first, last + 1);
-    try { return JSON.parse(sub); } catch {}
+  const candidates = extractJSONObjects(t);
+  for (const c of candidates) {
+    try { return JSON.parse(c); } catch {}
   }
   return null;
 }
-function buildPrompt({mode,index,total,headcount}){
-  return `あなたは競馬画像専用OCRです。\n\n【絶対ルール】\n・出力はJSONのみ。説明文、例、Markdown、コードブロックは禁止。\n・先頭は必ず {、末尾は必ず }。\n・読めない値は空文字 ""。推測しない。\n・同じ数字や同じ馬名を連続で増殖させない。\n・1行=1頭で処理する。\n・馬番と馬名を必ず同じ行のセットとして扱う。\n・mode=${mode}、画像 ${index}/${total}、頭数=${headcount || "不明"}。\n\n【返却JSON】\n{\n  "ok": true,\n  "race": {"name":"", "place":"", "grade":"", "surface":"", "distance":""},\n  "horses": [\n    {"frame":"", "no":"", "name":"", "last1":"", "last2":"", "last3":""}\n  ],\n  "odds": [\n    {"no":"", "name":"", "odds":""}\n  ],\n  "result": {\n    "firstNo":"", "first":"",\n    "secondNo":"", "second":"",\n    "thirdNo":"", "third":"",\n    "umaren":"", "umarenPay":"",\n    "sanrenpuku":"", "sanrenpukuPay":""\n  }\n}\n\n【抽出ルール】\n・出馬表なら horses を埋める。\n・単勝オッズなら odds を埋める。人気は返さなくてよい。\n・結果なら result を埋める。同着や馬連/3連複が複数ある場合はカンマ区切り。\n・画像に存在しない項目は空配列または空文字。\n・JSON以外は絶対に返さない。`;
-}
-function sanitize(d){
-  const z = { ok: !!d.ok, race: d.race || {}, horses: Array.isArray(d.horses)?d.horses:[], odds: Array.isArray(d.odds)?d.odds:[], result: d.result || {} };
-  z.horses = z.horses.map(h=>({ frame:s(h.frame||h.waku), no:n(h.no||h.number||h.horseNo), name:s(h.name||h.horse), last1:n(h.last1||h.run1), last2:n(h.last2||h.run2), last3:n(h.last3||h.run3), odds:s(h.odds) })).filter(h=>h.no || h.name);
-  z.odds = z.odds.map(o=>({ no:n(o.no||o.number||o.horseNo), name:s(o.name), odds:s(o.odds||o.tansho||o.winOdds).replace(/倍/g,"") })).filter(o=>o.no || o.name || o.odds);
-  z.race = { name:s(z.race.name), place:s(z.race.place), grade:s(z.race.grade), surface:s(z.race.surface), distance:s(z.race.distance) };
-  z.result = { firstNo:n(z.result.firstNo), first:s(z.result.first), secondNo:n(z.result.secondNo), second:s(z.result.second), thirdNo:n(z.result.thirdNo), third:s(z.result.third), umaren:s(z.result.umaren), umarenPay:s(z.result.umarenPay), sanrenpuku:s(z.result.sanrenpuku), sanrenpukuPay:s(z.result.sanrenpukuPay) };
-  return z;
-}
-function s(v){ return String(v ?? "").trim(); }
-function n(v){ return s(v).replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).replace(/[^0-9]/g,""); }
-function mergeData(list){
-  const race = {name:"",place:"",grade:"",surface:"",distance:""};
-  const horseMap = new Map(); const oddsMap = new Map();
-  const result = {firstNo:"",first:"",secondNo:"",second:"",thirdNo:"",third:"",umaren:"",umarenPay:"",sanrenpuku:"",sanrenpukuPay:""};
-  for (const d of list) {
-    for (const k of Object.keys(race)) if (!race[k] && d.race?.[k]) race[k] = d.race[k];
-    for (const h of d.horses || []) {
-      const key = h.no || h.name; if (!key) continue;
-      const cur = horseMap.get(key) || {};
-      horseMap.set(key, { ...cur, ...emptySafe(cur,h) });
-    }
-    for (const o of d.odds || []) {
-      const key = o.no || o.name; if (!key) continue;
-      const cur = oddsMap.get(key) || {};
-      oddsMap.set(key, { ...cur, ...emptySafe(cur,o) });
-    }
-    for (const k of Object.keys(result)) if (!result[k] && d.result?.[k]) result[k] = d.result[k];
+
+function extractJSONObjects(text) {
+  const out = []; let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i=0;i<text.length;i++) {
+    const ch = text[i];
+    if (inStr) { if (esc) esc=false; else if (ch==='\\') esc=true; else if (ch==='"') inStr=false; continue; }
+    if (ch==='"') { inStr=true; continue; }
+    if (ch==='{') { if (depth===0) start=i; depth++; }
+    if (ch==='}') { depth--; if (depth===0 && start>=0) { out.push(text.slice(start,i+1)); start=-1; } }
   }
-  const horses = [...horseMap.values()].sort((a,b)=>Number(a.no||999)-Number(b.no||999));
-  const odds = [...oddsMap.values()].sort((a,b)=>Number(a.no||999)-Number(b.no||999));
-  return { race, horses, odds, result };
+  return out;
 }
-function emptySafe(cur,next){ const out={}; for(const [k,v] of Object.entries(next||{})) out[k] = cur[k] ? cur[k] : v; return out; }
-function hasResult(r){ return Object.values(r||{}).some(Boolean); }
+
+function normalizeData(d) {
+  const race = d.race || {};
+  const result = d.result || {};
+  const horses = Array.isArray(d.horses) ? d.horses.map(h => ({
+    frame: cleanNum(h.frame), no: cleanNum(h.no || h.number), name: cleanName(h.name),
+    last1: cleanNum(h.last1), last2: cleanNum(h.last2), last3: cleanNum(h.last3)
+  })).filter(h => h.no || h.name) : [];
+  const odds = Array.isArray(d.odds) ? d.odds.map(o => ({
+    no: cleanNum(o.no || o.number), name: cleanName(o.name), odds: cleanOdds(o.odds)
+  })).filter(o => o.no || o.name || o.odds) : [];
+  return {
+    ok: d.ok !== false,
+    race: { name:String(race.name||''), place:String(race.place||''), grade:String(race.grade||''), surface:String(race.surface||''), distance:String(race.distance||'') },
+    horses, odds,
+    result: {
+      firstNo: cleanNum(result.firstNo), first: cleanName(result.first),
+      secondNo: cleanNum(result.secondNo), second: cleanName(result.second),
+      thirdNo: cleanNum(result.thirdNo), third: cleanName(result.third),
+      umaren: cleanTicket(result.umaren), umarenPay: cleanPay(result.umarenPay),
+      sanrenpuku: cleanTicket(result.sanrenpuku), sanrenpukuPay: cleanPay(result.sanrenpukuPay)
+    }
+  };
+}
+function cleanNum(v){ return String(v ?? '').replace(/[０-９]/g,s=>String.fromCharCode(s.charCodeAt(0)-0xFEE0)).replace(/[^0-9]/g,''); }
+function cleanOdds(v){ return String(v ?? '').replace(/[０-９．]/g,s=>s==='．'?'.':String.fromCharCode(s.charCodeAt(0)-0xFEE0)).replace(/[^0-9.]/g,''); }
+function cleanPay(v){ return String(v ?? '').replace(/[０-９]/g,s=>String.fromCharCode(s.charCodeAt(0)-0xFEE0)).replace(/[^0-9]/g,''); }
+function cleanName(v){ return String(v ?? '').replace(/[《》\[\]{}]/g,'').trim(); }
+function cleanTicket(v){ return String(v ?? '').replace(/[－ー―–]/g,'-').replace(/[^0-9\-]/g,''); }
 function hasRace(r){ return Object.values(r||{}).some(Boolean); }
+function hasResult(r){ return Object.values(r||{}).some(Boolean); }
+
+function mergeAll(raw) {
+  const merged = { race:{name:'',place:'',grade:'',surface:'',distance:''}, horses:[], odds:[], result:{firstNo:'',first:'',secondNo:'',second:'',thirdNo:'',third:'',umaren:'',umarenPay:'',sanrenpuku:'',sanrenpukuPay:''} };
+  const horseMap = new Map(), oddsMap = new Map();
+  for (const r of raw) {
+    if (!r.ok || !r.data) continue;
+    for (const k of Object.keys(merged.race)) if (!merged.race[k] && r.data.race?.[k]) merged.race[k] = r.data.race[k];
+    for (const h of r.data.horses || []) {
+      const key = h.no || h.name; if (!key) continue;
+      const old = horseMap.get(key) || {};
+      horseMap.set(key, { ...old, ...Object.fromEntries(Object.entries(h).filter(([,v])=>v)) });
+    }
+    for (const o of r.data.odds || []) {
+      const key = o.no || o.name; if (!key) continue;
+      const old = oddsMap.get(key) || {};
+      oddsMap.set(key, { ...old, ...Object.fromEntries(Object.entries(o).filter(([,v])=>v)) });
+    }
+    for (const k of Object.keys(merged.result)) if (!merged.result[k] && r.data.result?.[k]) merged.result[k] = r.data.result[k];
+  }
+  merged.horses = [...horseMap.values()].sort((a,b)=>(Number(a.no||999)-Number(b.no||999)));
+  merged.odds = [...oddsMap.values()].sort((a,b)=>(Number(a.no||999)-Number(b.no||999)));
+  return merged;
+}
+function cors(res){ const h=new Headers(res.headers); h.set('Access-Control-Allow-Origin','*'); h.set('Access-Control-Allow-Methods','GET,POST,OPTIONS'); h.set('Access-Control-Allow-Headers','Content-Type'); return new Response(res.body,{status:res.status,headers:h}); }
