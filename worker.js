@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
-    if (url.pathname === '/' || url.pathname === '/api/health') return cors(Response.json({ ok:true, name:'rev-ocr-worker-no-example-fixed', version:'2026-04-29-no-example-json-only' }));
+    if (url.pathname === '/' || url.pathname === '/api/health') return cors(Response.json({ ok:true, name:'rev-ocr-worker-no-example-fixed', version:'2026-04-29-object-response-fixed' }));
     if (url.pathname !== '/api/ocr') return cors(Response.json({ ok:false, error:'Not found', path:url.pathname }, { status:404 }));
     if (request.method !== 'POST') return cors(Response.json({ ok:false, error:'POST only' }, { status:405 }));
     try {
@@ -71,12 +71,32 @@ function buildPrompt(mode, headcount) {
 }
 
 function normalizeAIText(v) {
+  // Workers AI の返却形式差を吸収する。
+  // ここで String(オブジェクト) にすると [object Object] になるため、必ず再帰的に中身を取り出す。
+  if (v == null) return '';
   if (typeof v === 'string') return v.trim();
-  if (v?.response) return String(v.response).trim();
-  if (v?.result) return String(v.result).trim();
-  if (v?.text) return String(v.text).trim();
-  if (Array.isArray(v)) return v.map(normalizeAIText).join('\n').trim();
-  return JSON.stringify(v || '').trim();
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return v.map(normalizeAIText).filter(Boolean).join('\n').trim();
+
+  if (typeof v === 'object') {
+    // AIがJSONオブジェクトを直接返した場合
+    if (v.ok !== undefined || v.race || v.horses || v.odds || v.result) {
+      try { return JSON.stringify(v); } catch { return ''; }
+    }
+
+    // Cloudflare Workers AIでよくあるラップ形式
+    const keys = ['response', 'result', 'text', 'output', 'content', 'message', 'data'];
+    for (const k of keys) {
+      if (v[k] !== undefined && v[k] !== null) {
+        const inner = normalizeAIText(v[k]);
+        if (inner) return inner;
+      }
+    }
+
+    // 最後の保険。少なくとも [object Object] にはしない。
+    try { return JSON.stringify(v); } catch { return ''; }
+  }
+  return '';
 }
 
 function parseSingleJSON(text) {
