@@ -1,4 +1,4 @@
-name = "rev-ocr-3split-v13"
+name = "rev-ocr-canvas-crop-v14"
 main = "worker.js"
 compatibility_date = "2025-04-01"
 
