@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-    if (url.pathname !== "/api/ocr") return cors(Response.json({ ok:true, message:"Rev OCR Worker FIX2", endpoint:"/api/ocr" }));
+    if (url.pathname !== "/api/ocr") return cors(Response.json({ ok:true, message:"Rev OCR Worker FIX3", endpoint:"/api/ocr" }));
     if (request.method !== "POST") return cors(Response.json({ ok:false, error:"POST only" }, { status:405 }));
 
     try {
@@ -16,9 +16,9 @@ export default {
       const ai = await env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
         image: bytes,
         prompt: buildPrompt(mode),
-        max_tokens: 850,
+        max_tokens: 420,
         temperature: 0,
-        top_p: 0.01
+        top_p: 0.001
       });
 
       const rawText = typeof ai === "string" ? ai : (ai.response || ai.description || JSON.stringify(ai));
@@ -40,7 +40,7 @@ function cors(res){
 }
 
 function buildPrompt(mode){
-  const common = `あなたはJRA競馬画像専用OCRです。出力はJSONオブジェクト1個だけ。繰り返し禁止。解説禁止。Markdown禁止。コード禁止。読めない値は空文字。存在しない馬名を作らない。`;
+  const common = `あなたはJRA競馬画像専用OCRです。出力はJSONオブジェクト1個だけ。繰り返し禁止。解説禁止。Markdown禁止。コード禁止。サンプル生成禁止。推測禁止。読めない値は空文字。存在しない馬名・過去の有名馬名・架空の数値を作らない。画像に見えない項目は空文字/空配列。表にある馬だけ返す。馬番が読める行だけ返す。`;
   const schemas = {
     entry: `画像からレース情報と見えている馬番/枠/馬名だけ抽出。形式だけ厳守:{"ok":true,"race":{"date":"","place":"","raceNo":"","raceName":"","grade":"","condition":"","age":"","sex":"","surface":"","distance":"","headcount":""},"horses":[{"frame":"","no":"","name":""}]}`,
     runs: `前走/前2走/前3走の着順だけ抽出。last1,last2,last3は数字だけ。馬名・オッズ・人気は禁止。形式だけ厳守:{"ok":true,"horses":[{"no":"","last1":"","last2":"","last3":""}]}`,
@@ -48,17 +48,17 @@ function buildPrompt(mode){
     result: `結果と払戻を抽出。3着馬番は3連複の3頭と照合。馬連払戻と3連複払戻を取り違えない。形式だけ厳守:{"ok":true,"result":{"firstNo":"","secondNo":"","thirdNo":"","umaren":"","umarenPay":"","sanrenpuku":"","sanrenpukuPay":""}}`,
     auto: `画像内容に応じて必要なキーだけ返す。形式だけ厳守:{"ok":true,"race":{},"horses":[],"odds":[],"result":{}}`
   };
-  return `${common}\nmode=${mode}\n${schemas[mode] || schemas.auto}\nJSONを1個だけ返す。`;
+  return `${common}\nmode=${mode}\n${schemas[mode] || schemas.auto}\nJSONを1個だけ返す。複数JSON・連番テストデータ・説明文を出したら失敗。`;
 }
 
 function pickBestJson(text, mode){
   if (typeof text === "object" && text) return text;
   const s = String(text || "").trim();
-  try { return JSON.parse(s); } catch(e) {}
+  try { return validateParsed(JSON.parse(s), mode, s); } catch(e) {}
   const objs = extractJsonObjects(s).map(x => { try { return JSON.parse(x); } catch(e){ return null; } }).filter(Boolean);
   if (!objs.length) return { ok:false, error:"AI returned non-JSON text", rawText:s.slice(0, 4000) };
   objs.sort((a,b) => scoreJson(b, mode) - scoreJson(a, mode));
-  return objs[0];
+  return validateParsed(objs[0], mode, s);
 }
 
 function extractJsonObjects(s){
@@ -91,10 +91,43 @@ function cleanPay(v){ return z2h(v).replace(/[円\s,，]/g, ""); }
 function validRun(v){ const n = Number(onlyNum(v)); return n >= 0 && n <= 30; }
 function combo(v){ return String(v ?? "").split(/[-－ー,、\s]+/).map(onlyNum).filter(Boolean).sort((a,b)=>Number(a)-Number(b)).join("-"); }
 
+
+function isSyntheticEntry(d, raw=""){
+  const race=d?.race||{}; const hs=d?.horses||[]; const t=String(raw||"");
+  const objs=extractJsonObjects(t).map(x=>{try{return JSON.parse(x)}catch(e){return null}}).filter(Boolean);
+  const raceNos=[...new Set(objs.map(o=>onlyNum(o?.race?.raceNo)).filter(Boolean))];
+  const raceNames=[...new Set(objs.map(o=>String(o?.race?.raceName||"").trim()).filter(Boolean))];
+  if(raceNos.length>=5 && raceNames.length<=2) return true;
+  if(hs.length<=1 && /メイショウハリオ|スプリングステークス|2023\/03\/18/.test(JSON.stringify(d))) return true;
+  return false;
+}
+function isSyntheticRuns(d, raw=""){
+  const hs=d?.horses||[]; if(!hs.length) return false;
+  let seq=0; hs.forEach((h,i)=>{const a=[h.last1,h.last2,h.last3].map(onlyNum).map(Number); if(a[0]===i*3+1 && a[1]===i*3+2 && a[2]===i*3+3) seq++;});
+  return seq>=Math.min(3,hs.length) || /"last1":"1","last2":"2","last3":"3"/.test(String(raw||""));
+}
+function isSyntheticOdds(d, raw=""){
+  const os=d?.odds||[]; if(!os.length) return false;
+  const names=os.map(o=>String(o.name||"").trim()).filter(Boolean);
+  const odds=os.map(o=>cleanOdds(o.odds)).filter(Boolean);
+  const count=a=>a.reduce((m,x)=>(m[x]=(m[x]||0)+1,m),{});
+  const maxName=Math.max(...Object.values(count(names)),0), maxOdds=Math.max(...Object.values(count(odds)),0);
+  if(os.length>=4 && (maxName>=os.length-1 || maxOdds>=os.length-1)) return true;
+  return /メイショウダッフィー|サクラメガミ|ダイワスカーレット|メイショウドトウ/.test(JSON.stringify(d));
+}
+function validateParsed(d, mode, raw=""){
+  if(!d || d.ok===false) return d;
+  if(mode==="entry" && isSyntheticEntry(d, raw)) { d._syntheticEntry = true; d._warning = "レース情報は架空疑いのため反映停止。出馬表だけ返します。"; return d; }
+  if(mode==="runs" && isSyntheticRuns(d, raw)) return {ok:false,error:"前走着順の架空連番データを検出したため反映停止",rawText:String(raw||"").slice(0,3000)};
+  if(mode==="odds" && isSyntheticOdds(d, raw)) return {ok:false,error:"オッズの架空/重複データを検出したため反映停止",rawText:String(raw||"").slice(0,3000)};
+  return d;
+}
+
 function normalize(d, mode){
   const out = { ok: d?.ok !== false, race:{}, horses:[], odds:[], result:{} };
-  if (!d || d.ok === false) return { ...out, ok:false, error:d?.error || "parse failed" };
-  if (d.race) out.race = d.race;
+  if (!d || d.ok === false) return { ...out, ok:false, error:d?.error || "parse failed", rawText:d?.rawText||"" };
+  if (d.race && !d._syntheticEntry) out.race = d.race;
+  if (d._syntheticEntry) out.warning = d._warning || "レース情報は架空疑いのため未反映";
   if (Array.isArray(d.horses)) {
     out.horses = d.horses.map(h => {
       const base = { no:onlyNum(h.no ?? h.number), frame:onlyNum(h.frame), name:String(h.name ?? "").trim() };
@@ -104,7 +137,8 @@ function normalize(d, mode){
         base.last3 = validRun(h.last3) ? onlyNum(h.last3) : "";
       }
       return base;
-    }).filter(h => h.no || h.name || h.last1 || h.last2 || h.last3);
+    }).filter(h => h.no || h.name || h.last1 || h.last2 || h.last3)
+      .filter(h => !(d._syntheticEntry && /メイショウハリオ|メイショウダッフィー|サクラメガミ|ダイワスカーレット|メイショウドトウ/.test(h.name)));
   }
   if (Array.isArray(d.odds)) out.odds = d.odds.map(o => ({ no:onlyNum(o.no ?? o.number), name:String(o.name ?? "").trim(), odds:cleanOdds(o.odds) })).filter(o => o.no && o.odds);
   if (d.result) {
