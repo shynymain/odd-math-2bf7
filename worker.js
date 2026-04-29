@@ -1,11 +1,26 @@
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+function json(data, status=200){
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type":"application/json; charset=utf-8", ...CORS }
+  });
+}
+
 export default {
  async fetch(request, env) {
-  if (request.method === "GET") return Response.json({ok:true,service:"rev-production-worker"});
-  if (request.method !== "POST") return Response.json({ok:false,error:"POST only"},{status:405});
+  if (request.method === "OPTIONS") return new Response(null, { status:204, headers:CORS });
+  if (request.method === "GET") return json({ok:true,service:"rev-production-worker-v2-cors",message:"API通信OK"});
+  if (request.method !== "POST") return json({ok:false,error:"POST only"},405);
   try{
-   if(!env.AI) return Response.json({ok:false,error:"Workers AI binding 'AI' がありません"});
+   if(!env.AI) return json({ok:false,error:"Workers AI binding 'AI' がありません"});
    const form=await request.formData();
-   const file=form.get("file"); if(!file) return Response.json({ok:false,error:"画像ファイルがありません"});
+   const file=form.get("file"); 
+   if(!file) return json({ok:false,error:"画像ファイルがありません"});
    const allowed=parseAllowed(String(form.get("allowedFrame")||"1-3"));
    const head=Number(form.get("headcount")||18);
    const image=new Uint8Array(await file.arrayBuffer());
@@ -17,8 +32,8 @@ export default {
    const ai=await env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct",{image,temperature:0,max_tokens:900,prompt});
    const raw=String(ai.response||ai.text||"");
    const horses=parseBest(raw,allowed,head);
-   return Response.json({ok:true,mode:"entry-block",parser:"production-guard",allowedFrame:allowed.join(","),headcount:head,count:horses.length,horses,rawText:raw});
-  }catch(e){return Response.json({ok:false,error:String(e)})}
+   return json({ok:true,mode:"entry-block",parser:"production-guard-v2-cors",allowedFrame:allowed.join(","),headcount:head,count:horses.length,horses,rawText:raw});
+  }catch(e){return json({ok:false,error:String(e)})}
  }
 }
 function parseAllowed(s){if(s.includes("-")){let[a,b]=s.split("-").map(Number),r=[];for(let i=a;i<=b;i++)r.push(String(i));return r}return s.split(",").map(x=>x.trim()).filter(Boolean)}
